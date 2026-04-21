@@ -1,79 +1,50 @@
-const { Client, LocalAuth } = require('whatsapp-web.js')
-const qrcode = require('qrcode-terminal')
-const express = require('express')
-const app = express()
+const{default:makeWASocket,useMultiFileAuthState,DisconnectReason}=require('@whiskeysockets/baileys')
+const express=require('express')
+const qrcode=require('qrcode')
+const fs=require('fs')
+const app=express()
 app.use(express.json())
 
-let client = null
-let clientReady = false
-let lastQR = null
+let sock=null
+let qrData=null
+let connected=false
 
-function initClient() {
-  client = new Client({
-    authStrategy: new LocalAuth(),
-    puppeteer: {
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-      headless: true
+async function connect(){
+  const{state,saveCreds}=await useMultiFileAuthState('./auth')
+  sock=makeWASocket({auth:state,printQRInTerminal:true,logger:require('pino')({level:'silent'})})
+  sock.ev.on('creds.update',saveCreds)
+  sock.ev.on('connection.update',({connection,lastDisconnect,qr})=>{
+    if(qr){qrData=qr;connected=false;console.log('QR gerado')}
+    if(connection==='open'){connected=true;qrData=null;console.log('✅ WhatsApp conectado!')}
+    if(connection==='close'){
+      connected=false
+      const code=lastDisconnect?.error?.output?.statusCode
+      if(code!==DisconnectReason.loggedOut){setTimeout(connect,3000)}
+      else{fs.rmSync('./auth',{recursive:true,force:true});connect()}
     }
   })
-
-  client.on('qr', (qr) => {
-    lastQR = qr
-    clientReady = false
-    qrcode.generate(qr, { small: true })
-    console.log('QR gerado — acesse /qr para ver')
-  })
-
-  client.on('ready', () => {
-    clientReady = true
-    lastQR = null
-    console.log('✅ WhatsApp conectado!')
-  })
-
-  client.on('disconnected', () => {
-    clientReady = false
-    console.log('Desconectado, reiniciando...')
-    setTimeout(initClient, 5000)
-  })
-
-  client.initialize()
 }
 
-// GET / — health check
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', connected: clientReady })
+app.get('/',(req,res)=>res.json({status:'ok',connected,hasQR:!!qrData}))
+
+app.get('/qr',async(req,res)=>{
+  if(connected)return res.json({status:'connected'})
+  if(!qrData)return res.json({status:'waiting',message:'Reiniciando...'})
+  const url=await qrcode.toDataURL(qrData)
+  res.send('<html><body style="background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh"><h1 style="color:#00ff41;font-family:monospace">KURMO - Escanear QR</h1><img src="'+url+'" style="width:300px;height:300px"/><p style="color:#888;font-family:monospace">Abra o WhatsApp > Menu > Dispositivos conectados > Conectar dispositivo</p></body></html>')
 })
 
-// GET /qr — show QR code as text
-app.get('/qr', (req, res) => {
-  if (clientReady) return res.json({ status: 'already_connected' })
-  if (!lastQR) return res.json({ status: 'waiting_for_qr', message: 'Reinicie o serviço se demorar' })
-  // Return QR as JSON (use an online QR renderer)
-  res.json({ 
-    status: 'scan_qr',
-    qr: lastQR,
-    qr_url: 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=' + encodeURIComponent(lastQR)
-  })
+app.post('/send',async(req,res)=>{
+  const{phone,message}=req.body
+  if(!phone||!message)return res.status(400).json({error:'phone e message obrigatorios'})
+  if(!connected)return res.status(503).json({error:'WhatsApp nao conectado',connected:false})
+  try{
+    const num=phone.replace(/\D/g,'')
+    const jid=(num.startsWith('55')?num:'55'+num)+'@s.whatsapp.net'
+    await sock.sendMessage(jid,{text:message})
+    res.json({success:true})
+  }catch(e){res.status(500).json({error:e.message})}
 })
 
-// POST /send — send message
-app.post('/send', async (req, res) => {
-  const { phone, message } = req.body
-  if (!phone || !message) return res.status(400).json({ error: 'phone e message obrigatórios' })
-  if (!clientReady) return res.status(503).json({ error: 'WhatsApp não conectado', connected: false })
-  try {
-    // Format: 5527999999999@c.us
-    const num = phone.replace(/\D/g, '')
-    const formatted = (num.startsWith('55') ? num : '55' + num) + '@c.us'
-    await client.sendMessage(formatted, message)
-    res.json({ success: true, to: formatted })
-  } catch (e) {
-    res.status(500).json({ error: e.message })
-  }
-})
-
-const PORT = process.env.PORT || 3000
-app.listen(PORT, () => {
-  console.log(`API rodando na porta ${PORT}`)
-  initClient()
-})
+const PORT=process.env.PORT||3000
+app.listen(PORT,()=>{console.log('Porta '+PORT);connect()})
