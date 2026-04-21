@@ -1,15 +1,6 @@
-const {
-  default: makeWASocket,
-  DisconnectReason,
-  useMultiFileAuthState,
-  makeCacheableSignalKeyStore,
-  PHONENUMBER_MCC
-} = require('@whiskeysockets/baileys')
-const { Boom } = require('@hapi/boom')
+const { Client, LocalAuth } = require('whatsapp-web.js')
 const express = require('express')
 const QRCode = require('qrcode')
-const pino = require('pino')
-const fs = require('fs')
 
 const app = express()
 app.use(express.json())
@@ -21,137 +12,85 @@ app.use((req,res,next)=>{
   next()
 })
 
-let sock=null, qrData=null, connected=false, retries=0, timer=null, delay=8000
+let qrData=null, connected=false, client=null
 
-function log(...a){ console.log('[WA]',...a) }
+function createClient(){
+  client = new Client({
+    authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }),
+    puppeteer: {
+      headless: true,
+      args: [
+        '--no-sandbox','--disable-setuid-sandbox',
+        '--disable-dev-shm-usage','--disable-accelerated-2d-canvas',
+        '--no-first-run','--no-zygote','--single-process','--disable-gpu'
+      ]
+    }
+  })
 
-async function start(){
-  clearTimeout(timer)
-  try{
-    const { state, saveCreds } = await useMultiFileAuthState('./wa_auth')
-    const logger = pino({ level:'silent' })
+  client.on('qr', async (qr) => {
+    console.log('[WA] QR gerado!')
+    qrData = qr
+    connected = false
+  })
 
-    sock = makeWASocket({
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger)
-      },
-      logger,
-      printQRInTerminal: true,
-      browser: ['Kurmo PDV','Safari','1.0'],
-      generateHighQualityLinkPreview: false,
-      syncFullHistory: false,
-      markOnlineOnConnect: false,
-    })
+  client.on('ready', () => {
+    console.log('[WA] Conectado!')
+    connected = true
+    qrData = null
+  })
 
-    sock.ev.on('creds.update', saveCreds)
+  client.on('disconnected', (reason) => {
+    console.log('[WA] Desconectado:', reason)
+    connected = false
+    setTimeout(()=>{ try{ client.initialize() }catch(e){ setTimeout(createClient,5000) } }, 5000)
+  })
 
-    sock.ev.on('connection.update', async (update)=>{
-      const { connection, lastDisconnect, qr } = update
-
-      if(qr){
-        log('QR gerado!')
-        qrData = qr
-        connected = false
-      }
-
-      if(connection === 'open'){
-        log('Conectado!')
-        connected = true
-        qrData = null
-        retries = 0
-        delay = 8000
-      }
-
-      if(connection === 'close'){
-        connected = false
-        const code = new Boom(lastDisconnect?.error)?.output?.statusCode
-        log('Desconectado codigo:', code)
-
-        if(code === DisconnectReason.loggedOut){
-          log('Logout - limpando sessao')
-          try{ fs.rmSync('./wa_auth',{recursive:true,force:true}) }catch(e){}
-          retries = 0
-          delay = 8000
-          timer = setTimeout(start, 3000)
-        } else if(code === 428 || code === 408 || code === 503){
-          // Timeout/unavailable - retry normal
-          timer = setTimeout(start, delay)
-        } else if(code === 515 || code === 500){
-          // Server error - backoff exponencial
-          retries++
-          delay = Math.min(delay * 1.8, 120000)
-          log('Aguardando', Math.round(delay/1000)+'s (tentativa '+retries+')')
-          timer = setTimeout(start, delay)
-        } else {
-          timer = setTimeout(start, 8000)
-        }
-      }
-    })
-  }catch(err){
-    log('Erro:', err.message)
-    delay = Math.min((delay||8000)*2, 120000)
-    timer = setTimeout(start, delay)
-  }
+  client.initialize().catch(err=>{
+    console.log('[WA] Erro init:', err.message)
+    setTimeout(createClient, 10000)
+  })
 }
 
-app.get('/',(req,res)=>res.json({
-  name:'Kurmo WhatsApp API v3',
-  connected, retries, delay: Math.round(delay/1000)+'s'
-}))
+app.get('/',(req,res)=>res.json({name:'Kurmo WhatsApp API v4',connected}))
 
 app.get('/status',(req,res)=>{
   if(connected) return res.json({status:'connected',message:'WhatsApp conectado!'})
-  if(qrData) return res.json({status:'qr_ready',message:'QR Code pronto! Acesse /qr'})
-  res.json({status:'connecting',message:'Conectando... tentativa '+retries})
+  if(qrData) return res.json({status:'qr_ready',message:'QR pronto! Acesse /qr'})
+  res.json({status:'connecting',message:'Inicializando...'})
 })
 
 app.get('/qr', async (req,res)=>{
   if(connected) return res.json({status:'connected',message:'Ja conectado!'})
-  if(!qrData) return res.json({status:'waiting',message:'Aguarde o QR Code ser gerado...'})
+  if(!qrData) return res.json({status:'waiting',message:'Aguarde o QR Code...'})
   try{
-    const img = await QRCode.toDataURL(qrData,{width:280,margin:2})
-    res.send('<html><head><title>Kurmo QR</title>' +
-      '<meta http-equiv="refresh" content="20">' +
-      '<style>body{background:#0a0a0a;display:flex;flex-direction:column;align-items:center;' +
-      'justify-content:center;min-height:100vh;font-family:sans-serif;color:#fff;margin:0}' +
-      'h2{color:#00ff41;letter-spacing:2px;margin-bottom:8px}' +
-      'p{color:#888;font-size:13px;margin-bottom:16px;text-align:center}' +
-      'img{border:3px solid #00ff41;border-radius:10px;padding:10px;background:#fff}' +
-      '.tip{margin-top:10px;font-size:11px;color:#555}' +
-      '</style></head><body>' +
-      '<h2>KURMO PDV - WHATSAPP</h2>' +
-      '<p>WhatsApp &rarr; Dispositivos vinculados &rarr; Vincular dispositivo</p>' +
-      '<img src="' + img + '"/>' +
-      '<p class="tip">Pagina atualiza a cada 20s</p>' +
+    const img=await QRCode.toDataURL(qrData,{width:280})
+    res.send('<html><head><title>Kurmo QR</title><meta http-equiv="refresh" content="30">'+
+      '<style>body{background:#0a0a0a;display:flex;flex-direction:column;align-items:center;'+
+      'justify-content:center;min-height:100vh;font-family:sans-serif;color:#fff;margin:0}'+
+      'h2{color:#00ff41;letter-spacing:2px}p{color:#888;font-size:13px;margin:8px 0 16px;text-align:center}'+
+      'img{border:3px solid #00ff41;border-radius:10px;padding:10px;background:#fff}'+
+      '</style></head><body>'+
+      '<h2>KURMO PDV - WHATSAPP</h2>'+
+      '<p>WhatsApp > Dispositivos vinculados > Vincular dispositivo</p>'+
+      '<img src="'+img+'"/>'+
       '</body></html>')
   }catch(e){res.status(500).json({error:e.message})}
 })
 
 app.post('/send', async (req,res)=>{
-  if(!connected||!sock) return res.status(503).json({error:'WhatsApp nao conectado'})
+  if(!connected||!client) return res.status(503).json({error:'WhatsApp nao conectado'})
   const {phone,message}=req.body
   if(!phone||!message) return res.status(400).json({error:'phone e message obrigatorios'})
   try{
     const n=phone.replace(/\D/g,'')
-    const jid=(n.startsWith('55')?n:'55'+n)+'@s.whatsapp.net'
-    await sock.sendMessage(jid,{text:message})
+    const jid=(n.startsWith('55')?n:'55'+n)+'@c.us'
+    await client.sendMessage(jid, message)
     res.json({success:true,to:jid})
   }catch(e){res.status(500).json({error:e.message})}
 })
 
-app.get('/reset',(req,res)=>{
-  log('Reset solicitado')
-  connected=false; qrData=null; retries=0; delay=8000
-  clearTimeout(timer)
-  if(sock){try{sock.end(new Error('reset'))}catch(e){} sock=null}
-  try{fs.rmSync('./wa_auth',{recursive:true,force:true})}catch(e){}
-  timer=setTimeout(start,1000)
-  res.json({success:true,message:'Reset feito! Acesse /qr em alguns segundos.'})
-})
-
 const PORT=process.env.PORT||3000
 app.listen(PORT,()=>{
-  log('API rodando na porta', PORT)
-  start()
+  console.log('[API] Kurmo WhatsApp API v4 na porta',PORT)
+  createClient()
 })
